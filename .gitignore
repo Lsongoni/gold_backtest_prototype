@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.env
+*.log
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Data files
+data/*
+!data/.gitkeep
+*.xlsx
+*.xls
+*.csv
+*.parquet
+*.pkl
+*.zip
+
+# Outputs
+outputs/*
+!outputs/.gitkeep
+!outputs/charts/
+
+# Charts
+outputs/charts/*
+!outputs/charts/.gitkeep
+
+# Secrets
+*.key
+*.token
+.env
+config.local.py
+
