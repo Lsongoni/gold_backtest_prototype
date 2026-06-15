@@ -50,17 +50,25 @@ def _summary_row(
     error_message: str = "",
     start_datetime: str = "",
     end_datetime: str = "",
+    timeframe: str = "",
+    original_unit: str = "cny_per_gram",
+    converted_unit: str = "cny_per_gram",
+    fx_rate: float | None = None,
 ) -> dict:
     return {
         "source": source,
         "symbol": symbol,
         "period": "" if period is None else str(period),
+        "timeframe": timeframe,
         "rows": rows,
         "start_datetime": start_datetime,
         "end_datetime": end_datetime,
         "file_path": file_path,
         "status": status,
         "error_message": error_message,
+        "original_unit": original_unit,
+        "converted_unit": converted_unit,
+        "fx_rate": fx_rate,
     }
 
 
@@ -191,4 +199,3 @@ def fetch_market_data(
                 )
 
     return pd.DataFrame(summary, columns=MARKET_SUMMARY_COLUMNS), warnings
-

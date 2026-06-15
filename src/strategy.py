@@ -12,6 +12,7 @@ from .utils_time import combine_date_time, filter_by_date, first_available, last
 @dataclass
 class FixingDecision:
     trend_signal: str
+    trend_decision_time: str
     fixing_time: str
     fixing_price: float | None
     data_quality_flag: str
@@ -24,22 +25,42 @@ def add_moving_averages(market_df: pd.DataFrame, windows: list[int] | None = Non
     return work
 
 
-def determine_trend(market_df: pd.DataFrame, day: date, ma_window: int) -> tuple[str, str]:
+def _last_between(day_df: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.Series | None:
+    if day_df.empty:
+        return None
+    subset = day_df.loc[(day_df["datetime"] >= start_dt) & (day_df["datetime"] <= end_dt)].sort_values("datetime")
+    if subset.empty:
+        return None
+    return subset.iloc[-1]
+
+
+def determine_trend(market_df: pd.DataFrame, day: date, ma_window: int) -> tuple[str, str, str]:
     day_df = filter_by_date(market_df, day)
-    first_row = first_available(day_df)
-    if first_row is None:
-        return "missing", "no_market_data"
+    if day_df.empty:
+        return "missing", "no_market_data", ""
+
+    decision_row = last_before(day_df, combine_date_time(day, "10:00"))
+    decision_flag = "ok"
+    if decision_row is None:
+        decision_row = first_available(day_df)
+        decision_flag = "trend_fallback_first"
+    if decision_row is None:
+        return "missing", "no_market_data", ""
 
     ma_col = f"ma_{ma_window}"
-    ma_value = first_row.get(ma_col)
-    close = first_row.get("close")
+    ma_value = decision_row.get(ma_col)
+    close = decision_row.get("close")
+    decision_time = _format_time(decision_row)
     if pd.isna(ma_value) or pd.isna(close):
-        return "sideways", "ma_insufficient"
+        flag = "ma_insufficient"
+        if decision_flag != "ok":
+            flag = f"{flag};{decision_flag}"
+        return "sideways", flag, decision_time
     if close > ma_value:
-        return "uptrend", "ok"
+        return "uptrend", decision_flag, decision_time
     if close < ma_value:
-        return "downtrend", "ok"
-    return "sideways", "ok"
+        return "downtrend", decision_flag, decision_time
+    return "sideways", decision_flag, decision_time
 
 
 def _format_time(row: pd.Series | None) -> str:
@@ -58,19 +79,29 @@ def _price(row: pd.Series | None) -> float | None:
 
 
 def _early_row(day_df: pd.DataFrame, day: date) -> tuple[pd.Series | None, str]:
+    start_dt = combine_date_time(day, "10:00")
     target_dt = combine_date_time(day, MORNING_FIX_TIME)
-    row = last_before(day_df, target_dt)
+    row = _last_between(day_df, start_dt, target_dt)
     if row is not None:
         return row, "ok"
+    row = last_before(day_df, target_dt)
+    if row is not None:
+        return row, "early_window_missing_fallback"
     return first_available(day_df), "early_fallback_first"
 
 
 def _late_row(day_df: pd.DataFrame, day: date) -> tuple[pd.Series | None, str]:
+    start_dt = combine_date_time(day, "20:30")
     target_dt = combine_date_time(day, LATE_FIX_TIME)
-    row = last_before(day_df, target_dt)
+    row = _last_between(day_df, start_dt, target_dt)
     if row is not None:
         return row, "ok"
-    return last_available(day_df), "late_fallback_last"
+    fallback = last_available(day_df)
+    if fallback is None:
+        return None, "missing_fixing_price"
+    if fallback["datetime"] < start_dt:
+        return fallback, "no_night_session_fallback"
+    return fallback, "late_window_missing_fallback"
 
 
 def _split_fix(day_df: pd.DataFrame, day: date) -> tuple[str, float | None, str]:
@@ -98,18 +129,19 @@ def select_fixing(
 ) -> FixingDecision:
     day_df = filter_by_date(market_df, day)
     if day_df.empty:
-        return FixingDecision("missing", "", None, "no_market_data")
+        return FixingDecision("missing", "", "", None, "no_market_data")
 
     trend_signal = "baseline"
+    trend_decision_time = ""
     quality_flags: list[str] = []
     effective_kind = strategy_kind
 
     if strategy_kind == "trend":
         if ma_window is None:
             raise ValueError("ma_window is required for trend strategy")
-        trend_signal, trend_flag = determine_trend(market_df, day, ma_window)
+        trend_signal, trend_flag, trend_decision_time = determine_trend(market_df, day, ma_window)
         if trend_flag != "ok":
-            quality_flags.append(trend_flag)
+            quality_flags.extend([flag for flag in trend_flag.split(";") if flag])
         if trend_signal == "uptrend":
             effective_kind = "early"
         elif trend_signal == "downtrend":
@@ -155,8 +187,8 @@ def select_fixing(
 
     return FixingDecision(
         trend_signal=trend_signal,
+        trend_decision_time=trend_decision_time,
         fixing_time=fixing_time,
         fixing_price=fixing_price,
         data_quality_flag=";".join(dict.fromkeys(quality_flags)) if quality_flags else "ok",
     )
-

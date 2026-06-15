@@ -5,6 +5,12 @@ from typing import Optional
 
 import pandas as pd
 
+_DATE_GROUP_CACHE: dict[int, dict[date, pd.DataFrame]] = {}
+
+
+def register_market_date_groups(market_df: pd.DataFrame, date_groups: dict[date, pd.DataFrame]) -> None:
+    _DATE_GROUP_CACHE[id(market_df)] = date_groups
+
 
 def parse_datetime(value) -> pd.Timestamp:
     """Parse one value into pandas Timestamp, returning NaT on failure."""
@@ -35,9 +41,18 @@ def row_to_dict(row: Optional[pd.Series]) -> Optional[dict]:
 
 def filter_by_date(market_df: pd.DataFrame, day: date) -> pd.DataFrame:
     if market_df.empty or "datetime" not in market_df.columns:
-        return market_df.iloc[0:0].copy()
-    mask = market_df["datetime"].dt.date == day
-    return market_df.loc[mask].sort_values("datetime").copy()
+        return pd.DataFrame(columns=market_df.columns)
+    date_groups = _DATE_GROUP_CACHE.get(id(market_df))
+    if isinstance(date_groups, dict):
+        grouped = date_groups.get(day)
+        if grouped is None:
+            return pd.DataFrame(columns=market_df.columns)
+        return grouped
+    if "date" in market_df.columns:
+        mask = market_df["date"] == day
+    else:
+        mask = market_df["datetime"].dt.date == day
+    return market_df.loc[mask].sort_values("datetime")
 
 
 def first_available(day_df: pd.DataFrame) -> Optional[pd.Series]:
@@ -94,4 +109,3 @@ def safe_month_str(value) -> str:
     if pd.isna(ts):
         return ""
     return ts.strftime("%Y-%m")
-

@@ -15,6 +15,8 @@ DAILY_TARGET_SALES_AMOUNT = 800_000.0
 SGE_SYMBOL = "Au99.99"
 FUTURES_SYMBOLS = ["AU0", "au0", "AU888", "AU88"]
 FUTURES_PERIODS = [5, 15, 30, 60]
+KAGGLE_DEFAULT_PERIODS = [5, 15, 30, 60]
+KAGGLE_SUPPORTED_PERIODS = [1, 5, 15, 30, 60, 240, 1440, 10080, 43200]
 MA_WINDOWS = [10, 30, 60]
 
 MORNING_FIX_TIME = "10:30"
@@ -56,7 +58,9 @@ DETAIL_COLUMNS = [
     "sales_amount",
     "sales_gram",
     "reference_price",
+    "reference_source",
     "trend_signal",
+    "trend_decision_time",
     "timeframe",
     "ma_window",
     "fixing_time",
@@ -72,12 +76,16 @@ MARKET_SUMMARY_COLUMNS = [
     "source",
     "symbol",
     "period",
+    "timeframe",
     "rows",
     "start_datetime",
     "end_datetime",
     "file_path",
     "status",
     "error_message",
+    "original_unit",
+    "converted_unit",
+    "fx_rate",
 ]
 
 MONTHLY_SUMMARY_COLUMNS = [
@@ -115,4 +123,3 @@ WARNING_COLUMNS = [
     "message",
     "context",
 ]
-

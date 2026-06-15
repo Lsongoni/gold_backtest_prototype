@@ -18,7 +18,7 @@ from .config import (
 )
 from .market_loader import MarketDataset
 from .strategy import add_moving_averages, select_fixing
-from .utils_time import combine_date_time, filter_by_date, first_available, nearest_to
+from .utils_time import combine_date_time, filter_by_date, first_available, nearest_to, register_market_date_groups
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +50,11 @@ def _is_valid_number(value) -> bool:
 def _daily_reference_from_sales(day_orders: pd.DataFrame) -> tuple[float | None, str]:
     market_values = pd.to_numeric(day_orders["market_price"], errors="coerce").dropna()
     if not market_values.empty:
-        return float(market_values.mean()), "sales_market_price_daily_avg"
+        return float(market_values.mean()), "sales_market_price"
     zhaojin_values = pd.to_numeric(day_orders["zhaojin_price"], errors="coerce").dropna()
     if not zhaojin_values.empty:
-        return float(zhaojin_values.mean()), "sales_zhaojin_price_daily_avg"
-    return None, "missing_sales_reference_price"
+        return float(zhaojin_values.mean()), "sales_zhaojin_price"
+    return None, "missing_reference_price"
 
 
 def _reference_for_row(
@@ -64,22 +64,22 @@ def _reference_for_row(
     dataset: MarketDataset,
 ) -> tuple[float | None, str]:
     if _is_valid_number(row.get("market_price")):
-        reference_flag = row.get("reference_flag")
-        if isinstance(reference_flag, str) and reference_flag:
-            return float(row["market_price"]), reference_flag
-        return float(row["market_price"]), "reference_sales_market_price"
+        reference_source = row.get("reference_source")
+        if isinstance(reference_source, str) and reference_source:
+            return float(row["market_price"]), reference_source
+        return float(row["market_price"]), "sales_market_price"
     if _is_valid_number(row.get("zhaojin_price")):
-        return float(row["zhaojin_price"]), "reference_sales_zhaojin_price"
+        return float(row["zhaojin_price"]), "sales_zhaojin_price"
 
     order_dt = row.get("order_datetime")
     if pd.notna(order_dt) and not day_df.empty:
         near = nearest_to(day_df, pd.Timestamp(order_dt))
         if near is not None and _is_valid_number(near.get("close")):
-            return float(near["close"]), "reference_nearest_market_close"
+            return float(near["close"]), "nearest_market_close"
 
     first_row = first_available(day_df)
     if first_row is not None and _is_valid_number(first_row.get("close")):
-        return float(first_row["close"]), "reference_day_first_market_close"
+        return float(first_row["close"]), "day_first_market_close"
 
     warning_collector.add(
         "missing_reference_price",
@@ -90,9 +90,81 @@ def _reference_for_row(
     return None, "missing_reference_price"
 
 
-def _build_real_order_plan(orders: pd.DataFrame) -> pd.DataFrame:
+def _parse_date_bound(value: str | None, end_of_day: bool = False) -> pd.Timestamp | None:
+    if not value:
+        return None
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    if end_of_day:
+        return ts.normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+    return ts.normalize()
+
+
+def _market_datetime_bounds(market_df: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if market_df.empty or "datetime" not in market_df.columns:
+        return None, None
+    return market_df["datetime"].min(), market_df["datetime"].max()
+
+
+def _build_real_order_plan(
+    orders: pd.DataFrame,
+    market_df: pd.DataFrame,
+    warning_collector: WarningCollector,
+    dataset: MarketDataset,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
     plan = orders.copy()
     plan["date"] = plan["order_datetime"].dt.date
+    user_start = _parse_date_bound(start_date)
+    user_end = _parse_date_bound(end_date, end_of_day=True)
+    if user_start is not None:
+        plan = plan.loc[plan["order_datetime"] >= user_start].copy()
+    if user_end is not None:
+        plan = plan.loc[plan["order_datetime"] <= user_end].copy()
+
+    market_start, market_end = _market_datetime_bounds(market_df)
+    if market_start is None or market_end is None:
+        warning_collector.add(
+            "no_usable_market_data",
+            "backtester",
+            "Selected market dataset has no usable datetime range",
+            f"dataset={dataset.symbol}_{dataset.timeframe}",
+        )
+        return plan.iloc[0:0].copy()
+
+    outside = (plan["order_datetime"] < market_start) | (plan["order_datetime"] > market_end)
+    if outside.any():
+        warning_collector.add(
+            "order_outside_market_range",
+            "backtester",
+            "Order datetime is outside selected market data range",
+            (
+                f"dataset={dataset.symbol}_{dataset.timeframe}, filtered_count={int(outside.sum())}, "
+                f"market_start={market_start}, market_end={market_end}"
+            ),
+        )
+        plan = plan.loc[~outside].copy()
+
+    if plan.empty:
+        warning_collector.add(
+            "data_range_note",
+            "backtester",
+            "No orders remain after applying selected market data range",
+            f"dataset={dataset.symbol}_{dataset.timeframe}, market_start={market_start}, market_end={market_end}",
+        )
+    else:
+        warning_collector.add(
+            "data_range_note",
+            "backtester",
+            "Actual real_orders backtest order range",
+            (
+                f"dataset={dataset.symbol}_{dataset.timeframe}, order_start={plan['order_datetime'].min()}, "
+                f"order_end={plan['order_datetime'].max()}, market_start={market_start}, market_end={market_end}, "
+                f"records={len(plan)}"
+            ),
+        )
     return plan
 
 
@@ -101,18 +173,60 @@ def _build_daily_800k_plan(
     market_df: pd.DataFrame,
     warning_collector: WarningCollector,
     dataset: MarketDataset,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> pd.DataFrame:
     rows: list[dict] = []
     work = orders.copy()
     work["date"] = work["order_datetime"].dt.date
-    for day, day_orders in work.groupby("date", sort=True):
+    sales_dates = set(work["date"].dropna())
+    market_dates = set(market_df["datetime"].dt.date) if not market_df.empty else set()
+    market_start, market_end = _market_datetime_bounds(market_df)
+
+    user_start = _parse_date_bound(start_date)
+    user_end = _parse_date_bound(end_date)
+    if user_start is not None or user_end is not None:
+        range_start = (user_start or pd.Timestamp(min(sales_dates or market_dates))).date()
+        range_end = (user_end or pd.Timestamp(max(sales_dates or market_dates))).date()
+        calendar_days = [d.date() for d in pd.date_range(range_start, range_end, freq="D")]
+        missing_market_days = [day for day in calendar_days if day not in market_dates]
+        if missing_market_days:
+            warning_collector.add(
+                "date_no_market_data",
+                "backtester",
+                "Requested daily_800k date has no market data and was skipped",
+                f"dataset={dataset.symbol}_{dataset.timeframe}, count={len(missing_market_days)}, sample={missing_market_days[:10]}",
+            )
+        plan_days = [day for day in calendar_days if day in market_dates]
+    else:
+        skipped_sales_dates = sorted(sales_dates - market_dates)
+        if skipped_sales_dates:
+            warning_collector.add(
+                "order_outside_market_range",
+                "backtester",
+                "Sales date is outside selected market data range and was skipped for daily_800k",
+                f"dataset={dataset.symbol}_{dataset.timeframe}, count={len(skipped_sales_dates)}, sample={skipped_sales_dates[:10]}",
+            )
+        plan_days = sorted(sales_dates & market_dates)
+
+    if not plan_days:
+        warning_collector.add(
+            "data_range_note",
+            "backtester",
+            "No daily_800k plan dates remain after applying market date availability",
+            f"dataset={dataset.symbol}_{dataset.timeframe}, market_start={market_start}, market_end={market_end}",
+        )
+
+    sales_by_date = {day: day_orders for day, day_orders in work.groupby("date", sort=True)}
+    for day in plan_days:
+        day_orders = sales_by_date.get(day, work.iloc[0:0])
         reference_price, reference_flag = _daily_reference_from_sales(day_orders)
         day_df = filter_by_date(market_df, day)
         if reference_price is None:
             first_row = first_available(day_df)
             if first_row is not None and _is_valid_number(first_row.get("close")):
                 reference_price = float(first_row["close"])
-                reference_flag = "reference_day_first_market_close"
+                reference_flag = "day_first_market_close"
             else:
                 warning_collector.add(
                     "missing_reference_price",
@@ -139,8 +253,18 @@ def _build_daily_800k_plan(
                 "fee": np.nan,
                 "sales_gram": sales_gram,
                 "date": day,
-                "reference_flag": reference_flag,
+                "reference_source": reference_flag,
             }
+        )
+    if rows:
+        warning_collector.add(
+            "data_range_note",
+            "backtester",
+            "Actual daily_800k backtest date range",
+            (
+                f"dataset={dataset.symbol}_{dataset.timeframe}, date_start={min(plan_days)}, "
+                f"date_end={max(plan_days)}, market_start={market_start}, market_end={market_end}, records={len(rows)}"
+            ),
         )
     return pd.DataFrame(rows)
 
@@ -223,6 +347,8 @@ def run_backtest(
     orders: pd.DataFrame,
     market_datasets: Iterable[MarketDataset],
     mode: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     warning_collector = WarningCollector()
     records: list[dict] = []
@@ -230,10 +356,33 @@ def run_backtest(
     for dataset in market_datasets:
         logger.info("Running backtest for dataset=%s_%s mode=%s", dataset.symbol, dataset.timeframe, mode)
         market_df = add_moving_averages(dataset.data)
+        if "date" not in market_df.columns:
+            market_df["date"] = market_df["datetime"].dt.date
+        register_market_date_groups(
+            market_df,
+            {
+                day: day_df.sort_values("datetime").copy()
+                for day, day_df in market_df.groupby("date", sort=False)
+            },
+        )
         if mode == "real_orders":
-            plan = _build_real_order_plan(orders)
+            plan = _build_real_order_plan(
+                orders,
+                market_df,
+                warning_collector,
+                dataset,
+                start_date=start_date,
+                end_date=end_date,
+            )
         elif mode == "daily_800k":
-            plan = _build_daily_800k_plan(orders, market_df, warning_collector, dataset)
+            plan = _build_daily_800k_plan(
+                orders,
+                market_df,
+                warning_collector,
+                dataset,
+                start_date=start_date,
+                end_date=end_date,
+            )
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
@@ -248,7 +397,7 @@ def run_backtest(
                 day = row.get("date")
                 order_id = str(row.get("order_id", ""))
                 day_df = filter_by_date(market_df, day)
-                reference_price, reference_flag = _reference_for_row(row, day_df, warning_collector, dataset)
+                reference_price, reference_source = _reference_for_row(row, day_df, warning_collector, dataset)
                 fixing = select_fixing(market_df, day, kind, ma_window=ma_window)
 
                 sales_gram = row.get("sales_gram")
@@ -270,7 +419,7 @@ def run_backtest(
                         f"mode={mode}, order_id={order_id}, date={day}",
                     )
 
-                quality_flag = _combine_quality_flags(reference_flag, fixing.data_quality_flag)
+                quality_flag = _combine_quality_flags(fixing.data_quality_flag)
                 _record_warning_from_flags(quality_flag, warning_collector, dataset, strategy_id, day, order_id)
 
                 records.append(
@@ -284,7 +433,9 @@ def run_backtest(
                         "sales_amount": row.get("sales_amount"),
                         "sales_gram": sales_gram,
                         "reference_price": reference_price,
+                        "reference_source": reference_source,
                         "trend_signal": fixing.trend_signal,
+                        "trend_decision_time": fixing.trend_decision_time,
                         "timeframe": dataset.timeframe,
                         "ma_window": spec["ma_window"],
                         "fixing_time": fixing.fixing_time,
