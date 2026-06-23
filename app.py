@@ -9,9 +9,13 @@ import pandas as pd
 from src.backtester import run_backtest
 from src.config import DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR, KAGGLE_SUPPORTED_PERIODS
 from src.data_fetcher import fetch_market_data
-from src.market_loader import load_kaggle_xau_files, load_market_datasets, summarize_existing_market_data
-from src.metrics import build_monthly_summary, build_strategy_ranking
-from src.report_writer import write_report
+from src.market_loader import (
+    diagnose_market_time_structure,
+    format_market_time_diagnosis,
+    load_kaggle_xau_files,
+    load_market_datasets,
+    summarize_existing_market_data,
+)
 from src.sales_loader import load_sales_orders
 
 
@@ -34,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=["real_orders", "daily_800k"],
-        required=True,
+        default=None,
         help="Backtest mode.",
     )
     parser.add_argument(
@@ -83,6 +87,17 @@ def _parse_args() -> argparse.Namespace:
         help="FX rate used to convert XAU/USD into CNY/gram.",
     )
     parser.add_argument(
+        "--market-time-offset-hours",
+        type=float,
+        default=0.0,
+        help="Hours to add to Kaggle market timestamps after parsing.",
+    )
+    parser.add_argument(
+        "--diagnose-market-time",
+        action="store_true",
+        help="Print timestamp-structure diagnostics for Kaggle market files and exit.",
+    )
+    parser.add_argument(
         "--start-date",
         default=None,
         help="Optional backtest start date, YYYY-MM-DD.",
@@ -110,6 +125,14 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_kaggle_market_files(args: argparse.Namespace, data_dir: Path) -> list[str]:
+    if args.market_files:
+        return [path.strip() for path in args.market_files.split(",") if path.strip()]
+    if args.market_file:
+        return [args.market_file]
+    return [str(path) for path in sorted(data_dir.glob("XAU_*_data.csv"))]
+
+
 def main() -> int:
     args = _parse_args()
     _setup_logging(args.log_level)
@@ -120,6 +143,29 @@ def main() -> int:
     data_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.diagnose_market_time:
+        market_file_paths = _resolve_kaggle_market_files(args, data_dir)
+        logger.info("Diagnosing Kaggle XAU market time files: %s", market_file_paths)
+        market_datasets, _, loader_warnings = load_kaggle_xau_files(
+            market_file_paths,
+            price_unit=args.price_unit,
+            fx_rate=args.fx_rate,
+            market_time_offset_hours=args.market_time_offset_hours,
+            period=args.period,
+        )
+        for warning in loader_warnings:
+            logger.warning("%s | %s | %s", warning["warning_type"], warning["message"], warning["context"])
+        for dataset in market_datasets:
+            print(format_market_time_diagnosis(diagnose_market_time_structure(dataset)))
+            print()
+        if not market_datasets:
+            logger.error("No usable Kaggle XAU market datasets were loaded for diagnosis.")
+            return 1
+        return 0
+
+    if args.mode is None:
+        raise SystemExit("--mode is required unless --diagnose-market-time is used.")
+
     all_warnings: list[dict] = []
     logger.info("Starting backtest prototype")
     orders_clean, sales_warnings = load_sales_orders(args.sales_file)
@@ -127,17 +173,13 @@ def main() -> int:
 
     use_kaggle = args.market_source == "kaggle_xau" or bool(args.market_file) or bool(args.market_files)
     if use_kaggle:
-        if args.market_files:
-            market_file_paths = [path.strip() for path in args.market_files.split(",") if path.strip()]
-        elif args.market_file:
-            market_file_paths = [args.market_file]
-        else:
-            market_file_paths = [str(path) for path in sorted(data_dir.glob("XAU_*_data.csv"))]
+        market_file_paths = _resolve_kaggle_market_files(args, data_dir)
         logger.info("Loading Kaggle XAU files: %s", market_file_paths)
         market_datasets, market_summary, loader_warnings = load_kaggle_xau_files(
             market_file_paths,
             price_unit=args.price_unit,
             fx_rate=args.fx_rate,
+            market_time_offset_hours=args.market_time_offset_hours,
             period=args.period,
         )
         all_warnings.extend(loader_warnings)
@@ -166,6 +208,8 @@ def main() -> int:
         monthly_summary = pd.DataFrame()
         strategy_ranking = pd.DataFrame()
     else:
+        from src.metrics import build_monthly_summary, build_strategy_ranking
+
         daily_detail, backtest_warnings = run_backtest(
             orders_clean,
             market_datasets,
@@ -176,6 +220,8 @@ def main() -> int:
         all_warnings.extend(backtest_warnings)
         monthly_summary = build_monthly_summary(daily_detail)
         strategy_ranking = build_strategy_ranking(daily_detail, monthly_summary)
+
+    from src.report_writer import write_report
 
     excel_path = write_report(
         output_dir=output_dir,

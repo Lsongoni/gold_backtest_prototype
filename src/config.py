@@ -86,6 +86,7 @@ MARKET_SUMMARY_COLUMNS = [
     "original_unit",
     "converted_unit",
     "fx_rate",
+    "market_time_offset_hours",
 ]
 
 MONTHLY_SUMMARY_COLUMNS = [

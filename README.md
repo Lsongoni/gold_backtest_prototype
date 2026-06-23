@@ -52,6 +52,18 @@ python app.py --sales-file "宝瑞雅投资金销售.xlsx" --mode real_orders --
 python app.py --sales-file "宝瑞雅投资金销售.xlsx" --mode real_orders --market-file "data/XAU_5m_data.csv" --market-source kaggle_xau --price-unit xauusd --fx-rate 7.2
 ```
 
+如果需要测试行情时间整体平移，例如把 Kaggle 原始时间加 8 小时：
+
+```bash
+python app.py --sales-file "宝瑞雅投资金销售.xlsx" --mode real_orders --market-file "data/XAU_5m_data.csv" --market-source kaggle_xau --price-unit xauusd --fx-rate 7.2 --market-time-offset-hours 8
+```
+
+诊断 Kaggle 数据时间结构：
+
+```bash
+python app.py --diagnose-market-time --market-file "data/XAU_5m_data.csv" --market-source kaggle_xau --price-unit xauusd --fx-rate 7.2
+```
+
 80 万压力测试，使用 Kaggle 5 分钟 XAU 数据：
 
 ```bash
@@ -89,6 +101,10 @@ Kaggle XAU CSV 数据：
 - 默认只跑 `5min`、`15min`、`30min`、`60min`。`1m`、`4h` 等非默认周期只有在明确指定 `--period` 时才会跑，避免数据量过大。
 - 如果 `--price-unit xauusd`，程序会按 `xau_price * fx_rate / 31.1035` 转换为人民币/克。
 - 如果 `--price-unit cny_per_gram`，程序不做价格换算。
+- Kaggle 数据集页面未明确说明时间戳时区，因此本项目不默认认定其为北京时间或 UTC。
+- `--market-time-offset-hours` 会在解析原始 `Date` 后对行情时间整体平移，用于做时区敏感性测试；例如 `8` 表示 `datetime = datetime_raw + 8小时`。
+- 程序会保留 `datetime_raw` 并使用平移后的 `datetime` 参与回测，`market_data_summary` 会记录 `market_time_offset_hours`。
+- `--diagnose-market-time` 可输出数据起止时间、每天第一/最后一根 K 线常见时间、每周第一根 K 线常见星期和时间、周末断点情况。该分析只能辅助判断时区，不能确认真实时区。
 
 重要限制：
 
@@ -192,6 +208,7 @@ outputs/charts/spread_distribution_best_strategy.png
 
 - 行情拉取或本地 CSV 读取摘要。
 - 包含 source、symbol、period、timeframe、rows、start_datetime、end_datetime、file_path、status、error_message、original_unit、converted_unit、fx_rate。
+- Kaggle XAU 数据会额外记录 `market_time_offset_hours`，用于说明当前回测使用的时间平移参数。
 
 `daily_detail`：
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,7 @@ class MarketDataset:
     original_unit: str = "cny_per_gram"
     converted_unit: str = "cny_per_gram"
     fx_rate: float | None = None
+    market_time_offset_hours: float = 0.0
 
 
 def _warning(warning_type: str, source: str, message: str, context: str = "") -> dict:
@@ -107,6 +109,7 @@ def _market_summary_row(
     original_unit: str = "",
     converted_unit: str = "",
     fx_rate: float | None = None,
+    market_time_offset_hours: float | None = None,
 ) -> dict:
     return {
         "source": source,
@@ -122,6 +125,7 @@ def _market_summary_row(
         "original_unit": original_unit,
         "converted_unit": converted_unit,
         "fx_rate": fx_rate,
+        "market_time_offset_hours": market_time_offset_hours,
     }
 
 
@@ -170,6 +174,7 @@ def load_kaggle_xau_file(
     file_path: str | Path,
     price_unit: str = "cny_per_gram",
     fx_rate: float = 7.2,
+    market_time_offset_hours: float = 0.0,
 ) -> MarketDataset:
     path = Path(file_path)
     parsed = parse_kaggle_xau_filename(path)
@@ -184,7 +189,8 @@ def load_kaggle_xau_file(
         raise ValueError(f"Missing required Kaggle columns: {missing}")
 
     data = pd.DataFrame()
-    data["datetime"] = pd.to_datetime(raw["Date"], format="%Y.%m.%d %H:%M", errors="coerce")
+    data["datetime_raw"] = pd.to_datetime(raw["Date"], format="%Y.%m.%d %H:%M", errors="coerce")
+    data["datetime"] = data["datetime_raw"] + pd.to_timedelta(market_time_offset_hours, unit="h")
     for source_col, target_col in [
         ("Open", "open"),
         ("High", "high"),
@@ -207,13 +213,14 @@ def load_kaggle_xau_file(
     data = data.dropna(subset=["datetime", "close"]).sort_values("datetime").reset_index(drop=True)
     data["date"] = data["datetime"].dt.date
     logger.info(
-        "Loaded Kaggle XAU file=%s rows=%s range=%s to %s unit=%s converted=%s",
+        "Loaded Kaggle XAU file=%s rows=%s range=%s to %s unit=%s converted=%s time_offset_hours=%s",
         path,
         len(data),
         data["datetime"].min() if not data.empty else "",
         data["datetime"].max() if not data.empty else "",
         price_unit,
         converted_unit,
+        market_time_offset_hours,
     )
     return MarketDataset(
         symbol="XAU",
@@ -225,6 +232,7 @@ def load_kaggle_xau_file(
         original_unit=price_unit,
         converted_unit=converted_unit,
         fx_rate=fx_rate,
+        market_time_offset_hours=market_time_offset_hours,
     )
 
 
@@ -232,6 +240,7 @@ def load_kaggle_xau_files(
     file_paths: list[str | Path],
     price_unit: str = "cny_per_gram",
     fx_rate: float = 7.2,
+    market_time_offset_hours: float = 0.0,
     period: int | None = None,
     default_periods: list[int] | None = None,
 ) -> tuple[list[MarketDataset], pd.DataFrame, list[dict]]:
@@ -261,6 +270,7 @@ def load_kaggle_xau_files(
                     price_unit,
                     "",
                     fx_rate,
+                    market_time_offset_hours,
                 )
             )
             continue
@@ -291,12 +301,18 @@ def load_kaggle_xau_files(
                     price_unit,
                     "",
                     fx_rate,
+                    market_time_offset_hours,
                 )
             )
             continue
 
         try:
-            dataset = load_kaggle_xau_file(path, price_unit=price_unit, fx_rate=fx_rate)
+            dataset = load_kaggle_xau_file(
+                path,
+                price_unit=price_unit,
+                fx_rate=fx_rate,
+                market_time_offset_hours=market_time_offset_hours,
+            )
             datasets.append(dataset)
             summary_rows.append(
                 _market_summary_row(
@@ -313,6 +329,7 @@ def load_kaggle_xau_files(
                     dataset.original_unit,
                     dataset.converted_unit,
                     dataset.fx_rate,
+                    dataset.market_time_offset_hours,
                 )
             )
             if dataset.data.empty:
@@ -334,6 +351,7 @@ def load_kaggle_xau_files(
                     price_unit,
                     "",
                     fx_rate,
+                    market_time_offset_hours,
                 )
             )
 
@@ -348,6 +366,102 @@ def load_kaggle_xau_files(
         )
 
     return datasets, pd.DataFrame(summary_rows, columns=MARKET_SUMMARY_COLUMNS), warnings
+
+
+def _top_counter_values(values: list[str], limit: int = 5) -> list[tuple[str, int]]:
+    return Counter(values).most_common(limit)
+
+
+def diagnose_market_time_structure(dataset: MarketDataset) -> dict:
+    data = dataset.data.copy()
+    if data.empty:
+        return {
+            "file_path": str(dataset.file_path),
+            "rows": 0,
+            "message": "No usable rows for market time diagnosis",
+        }
+
+    if "date" not in data.columns:
+        data["date"] = data["datetime"].dt.date
+    data = data.sort_values("datetime").reset_index(drop=True)
+    first_by_day = data.groupby("date", sort=True).first().reset_index()
+    last_by_day = data.groupby("date", sort=True).last().reset_index()
+
+    iso = data["datetime"].dt.isocalendar()
+    week_work = data.assign(iso_year=iso["year"], iso_week=iso["week"])
+    first_by_week = week_work.groupby(["iso_year", "iso_week"], sort=True).first().reset_index()
+
+    first_day_times = _top_counter_values(first_by_day["datetime"].dt.strftime("%H:%M").tolist())
+    last_day_times = _top_counter_values(last_by_day["datetime"].dt.strftime("%H:%M").tolist())
+    week_first_values = (
+        first_by_week["datetime"].dt.day_name().str[:3] + " " + first_by_week["datetime"].dt.strftime("%H:%M")
+    ).tolist()
+    first_week_times = _top_counter_values(week_first_values)
+
+    day_counts = data.groupby("date").size()
+    trading_days = pd.Series(pd.to_datetime(list(day_counts.index))).sort_values()
+    day_gaps = trading_days.diff().dt.days.dropna()
+    weekend_rows = data.loc[data["datetime"].dt.weekday >= 5]
+    long_gaps = day_gaps.loc[day_gaps > 1]
+    long_gap_counts = Counter(long_gaps.astype(int).tolist()).most_common(5)
+
+    friday_last = last_by_day.loc[pd.to_datetime(last_by_day["date"]).dt.weekday == 4, "datetime"]
+    monday_first = first_by_day.loc[pd.to_datetime(first_by_day["date"]).dt.weekday == 0, "datetime"]
+
+    return {
+        "file_path": str(dataset.file_path),
+        "symbol": dataset.symbol,
+        "period": dataset.period,
+        "timeframe": dataset.timeframe,
+        "rows": len(data),
+        "market_time_offset_hours": dataset.market_time_offset_hours,
+        "datetime_raw_start": data["datetime_raw"].min() if "datetime_raw" in data.columns else "",
+        "datetime_raw_end": data["datetime_raw"].max() if "datetime_raw" in data.columns else "",
+        "datetime_start": data["datetime"].min(),
+        "datetime_end": data["datetime"].max(),
+        "top_daily_first_times": first_day_times,
+        "top_daily_last_times": last_day_times,
+        "top_weekly_first_weekday_times": first_week_times,
+        "trading_day_count": int(len(day_counts)),
+        "weekend_row_count": int(len(weekend_rows)),
+        "weekend_dates_count": int(weekend_rows["date"].nunique()) if not weekend_rows.empty else 0,
+        "long_day_gap_count": int(len(long_gaps)),
+        "long_day_gap_days_top": long_gap_counts,
+        "top_friday_last_times": _top_counter_values(friday_last.dt.strftime("%H:%M").tolist()),
+        "top_monday_first_times": _top_counter_values(monday_first.dt.strftime("%H:%M").tolist()),
+        "hint": "This analysis can help evaluate timestamp structure, but it cannot confirm the real timezone.",
+    }
+
+
+def format_market_time_diagnosis(diagnosis: dict) -> str:
+    if diagnosis.get("rows", 0) == 0:
+        return f"Market time diagnosis for {diagnosis.get('file_path', '')}\n{diagnosis.get('message', '')}"
+
+    def fmt_top(items: list[tuple[str, int]]) -> str:
+        return ", ".join(f"{value} ({count})" for value, count in items) if items else "N/A"
+
+    lines = [
+        f"Market time diagnosis: {diagnosis['file_path']}",
+        f"symbol={diagnosis['symbol']} period={diagnosis['period']} timeframe={diagnosis['timeframe']} rows={diagnosis['rows']}",
+        f"market_time_offset_hours={diagnosis['market_time_offset_hours']}",
+        f"raw datetime range: {diagnosis['datetime_raw_start']} to {diagnosis['datetime_raw_end']}",
+        f"adjusted datetime range: {diagnosis['datetime_start']} to {diagnosis['datetime_end']}",
+        f"daily first bar most common times: {fmt_top(diagnosis['top_daily_first_times'])}",
+        f"daily last bar most common times: {fmt_top(diagnosis['top_daily_last_times'])}",
+        f"weekly first bar most common weekday/time: {fmt_top(diagnosis['top_weekly_first_weekday_times'])}",
+        (
+            "weekend break: "
+            f"trading_days={diagnosis['trading_day_count']}, "
+            f"weekend_rows={diagnosis['weekend_row_count']}, "
+            f"weekend_dates={diagnosis['weekend_dates_count']}, "
+            f"long_day_gaps={diagnosis['long_day_gap_count']}, "
+            f"gap_days_top={fmt_top([(str(v), c) for v, c in diagnosis['long_day_gap_days_top']])}"
+        ),
+        f"Friday last bar most common times: {fmt_top(diagnosis['top_friday_last_times'])}",
+        f"Monday first bar most common times: {fmt_top(diagnosis['top_monday_first_times'])}",
+        f"Hint: {diagnosis['hint']}",
+    ]
+    return "\n".join(lines)
 
 
 def summarize_existing_market_data(data_dir: str | Path) -> pd.DataFrame:
